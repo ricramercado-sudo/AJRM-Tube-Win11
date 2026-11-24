@@ -1,0 +1,57 @@
+name: Compilar AJRM-Tube para Windows 11
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias de Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Descargar FFmpeg y Deno para empaquetarlos dentro del EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bin
+
+          # Descargar FFmpeg Essentials (Windows x64)
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "ffmpeg.zip"
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_temp"
+          $ffmpegExe = Get-ChildItem -Path "ffmpeg_temp" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          $ffprobeExe = Get-ChildItem -Path "ffmpeg_temp" -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
+          Copy-Item $ffmpegExe.FullName -Destination "bin\ffmpeg.exe"
+          Copy-Item $ffprobeExe.FullName -Destination "bin\ffprobe.exe"
+
+          # Descargar Deno (Runtime JS para evitar bloqueos de YouTube)
+          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile "deno.zip"
+          Expand-Archive -Path "deno.zip" -DestinationPath "bin"
+
+      - name: Empaquetar AJRM-Tube.exe con PyInstaller
+        run: |
+          pyinstaller --noconfirm --onefile --windowed `
+            --name "AJRM-Tube" `
+            --collect-all customtkinter `
+            --add-binary "bin/ffmpeg.exe;." `
+            --add-binary "bin/ffprobe.exe;." `
+            --add-binary "bin/deno.exe;." `
+            main.py
+
+      - name: Subir instalador AJRM-Tube.exe como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AJRM-Tube-Windows11
+          path: dist/AJRM-Tube.exe
