@@ -1,8 +1,6 @@
 import os
-import re
 import sys
 import threading
-import subprocess
 from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -12,25 +10,25 @@ import customtkinter as ctk
 import yt_dlp
 
 # ==============================================================================
-# PALETA VISUAL INSPIRADA EN NUNAY AGENCIA (Limpia, moderna, alto contraste)
+# PALETA VISUAL EXACTA DE NUNAY AGENCIA (Dark Mode Profundo + Índigo Vibrante)
 # ==============================================================================
 COLORS = {
-    "bg_main": "#F5F7FA",         # Fondo general limpio y luminoso
-    "bg_card": "#FFFFFF",         # Tarjetas blancas con jerarquía
-    "bg_subtle": "#EDF1F7",       # Contenedores secundarios / inputs
-    "primary": "#0F172A",         # Azul marino profundo (identidad corporativa)
-    "primary_hover": "#1E293B",
-    "accent": "#0EA5E9",          # Cian vibrante para acciones y progreso
-    "accent_hover": "#0284C7",
+    "bg_main": "#050507",         # Negro profundo del fondo de Nunay
+    "bg_card": "#0D0D12",         # Tarjetas oscuras elevadas
+    "bg_subtle": "#15151E",       # Inputs y contenedores internos
+    "bg_hover": "#1E1E2B",
+    "indigo": "#4F46E5",          # Azul índigo/violeta de botones Nunay ("MENÚ", "Empezar")
+    "indigo_hover": "#4338CA",
+    "indigo_text": "#818CF8",     # Texto destacado índigo claro
     "success": "#10B981",         # Verde esmeralda (completado)
     "warning": "#F59E0B",         # Ámbar (pausado)
     "danger": "#EF4444",          # Rojo coral (cancelar / error)
-    "text_main": "#0F172A",
-    "text_muted": "#64748B",
-    "border": "#E2E8F0",
+    "text_main": "#FFFFFF",       # Blanco puro
+    "text_muted": "#94A3B8",      # Gris pizarra suave
+    "border": "#222230",          # Bordes finos estilo cuadrícula Nunay
 }
 
-ctk.set_appearance_mode("Light")
+ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
@@ -57,28 +55,25 @@ def format_duration(seconds) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def sanitize_filename(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
-
-
 # ==============================================================================
-# CONTROLADOR DE CADA DESCARGA EN LA COLA (Soporta Pausa, Reanudar y Cancelar)
+# CONTROLADOR DE CADA DESCARGA EN LA COLA (Pausa, Reanudar, Cancelar y Abrir)
 # ==============================================================================
 class DownloadTask:
     def __init__(self, url: str, title: str, mode: str, quality: str, out_dir: str, ui_callback):
         self.url = url
         self.title = title
-        self.mode = mode          # "Audio" o "Video"
-        self.quality = quality    # Ej: "MP3 320 kbps", "1080p Full HD"
+        self.mode = mode
+        self.quality = quality
         self.out_dir = out_dir
         self.ui_callback = ui_callback
 
         self.pause_event = threading.Event()
-        self.pause_event.set()    # True = activo, False = pausado
+        self.pause_event.set()
         self.cancel_flag = False
         self.status = "En cola"
         self.progress = 0.0
         self.speed_text = "Esperando..."
+        self.output_filepath = None
         self.thread = None
 
     def start(self):
@@ -105,11 +100,16 @@ class DownloadTask:
         self.speed_text = "Cancelado por el usuario"
         self.ui_callback(self)
 
+    def open_file(self):
+        if self.output_filepath and os.path.exists(self.output_filepath):
+            os.startfile(self.output_filepath)
+        elif os.path.exists(self.out_dir):
+            os.startfile(self.out_dir)
+
     def _progress_hook(self, d):
         if self.cancel_flag:
             raise Exception("CANCELLED_BY_USER")
 
-        # Si está pausado, bloquea el hilo limpiamente hasta que el usuario reanude
         while not self.pause_event.is_set():
             if self.cancel_flag:
                 raise Exception("CANCELLED_BY_USER")
@@ -130,8 +130,17 @@ class DownloadTask:
         elif d["status"] == "finished":
             self.status = "Procesando"
             self.progress = 0.99
-            self.speed_text = "Uniendo audio/video con FFmpeg..."
+            if d.get("filename"):
+                self.output_filepath = d.get("filename")
+            self.speed_text = "Finalizando archivo con FFmpeg..."
             self.ui_callback(self)
+
+    def _postprocessor_hook(self, d):
+        if d["status"] == "finished":
+            info = d.get("info_dict", {})
+            final_path = info.get("filepath") or d.get("filepath")
+            if final_path:
+                self.output_filepath = final_path
 
     def _run(self):
         try:
@@ -148,6 +157,7 @@ class DownloadTask:
                 "quiet": True,
                 "no_warnings": True,
                 "progress_hooks": [self._progress_hook],
+                "postprocessor_hooks": [self._postprocessor_hook],
                 "ffmpeg_location": bin_dir,
                 "concurrent_fragment_downloads": 4,
                 "retries": 5,
@@ -172,7 +182,6 @@ class DownloadTask:
                         {"key": "FFmpegMetadata"},
                     ]
             else:
-                # Video MP4 según resolución elegida
                 height_map = {
                     "480p Estándar": 480,
                     "720p HD": 720,
@@ -188,12 +197,23 @@ class DownloadTask:
                 ydl_opts["merge_output_format"] = "mp4"
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([self.url])
+                info = ydl.extract_info(self.url, download=True)
+                if not self.output_filepath or not os.path.exists(self.output_filepath):
+                    prepared = ydl.prepare_filename(info)
+                    base, _ = os.path.splitext(prepared)
+                    ext = ".mp3" if (self.mode == "Audio" and "MP3" in self.quality) else (
+                        ".m4a" if self.mode == "Audio" else ".mp4"
+                    )
+                    if os.path.exists(base + ext):
+                        self.output_filepath = base + ext
+                    elif os.path.exists(prepared):
+                        self.output_filepath = prepared
 
             if not self.cancel_flag:
                 self.status = "Completado"
                 self.progress = 1.0
-                self.speed_text = f"Guardado en: {os.path.basename(self.out_dir)}"
+                fname = os.path.basename(self.output_filepath) if self.output_filepath else self.out_dir
+                self.speed_text = f"Listo: {fname[:60]}"
                 self.ui_callback(self)
 
         except Exception as e:
@@ -208,13 +228,13 @@ class DownloadTask:
 
 
 # ==============================================================================
-# VENTANA DE SELECCIÓN DE PLAYLIST
+# VENTANA DE SELECCIÓN DE PLAYLIST (ESTILO NUNAY DARK)
 # ==============================================================================
 class PlaylistSelectorDialog(ctk.CTkToplevel):
     def __init__(self, parent, playlist_title: str, entries: list, on_confirm):
         super().__init__(parent)
         self.title("Seleccionar elementos de la Playlist")
-        self.geometry("680x520")
+        self.geometry("700x540")
         self.configure(fg_color=COLORS["bg_main"])
         self.transient(parent)
         self.grab_set()
@@ -223,53 +243,68 @@ class PlaylistSelectorDialog(ctk.CTkToplevel):
         self.on_confirm = on_confirm
         self.check_vars = []
 
-        # Encabezado
-        header = ctk.CTkFrame(self, fg_color=COLORS["bg_card"], corner_radius=12)
-        header.pack(fill="x", padx=16, pady=(16, 10))
+        header = ctk.CTkFrame(
+            self,
+            fg_color=COLORS["bg_card"],
+            corner_radius=16,
+            border_width=1,
+            border_color=COLORS["border"],
+        )
+        header.pack(fill="x", padx=18, pady=(18, 10))
 
         ctk.CTkLabel(
             header,
-            text=f"Playlist detectada ({len(entries)} elementos)",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            text_color=COLORS["accent"],
-        ).pack(anchor="w", padx=16, pady=(12, 0))
+            text=f"PLAYLIST DETECTADA  •  {len(entries)} ELEMENTOS",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            text_color=COLORS["indigo_text"],
+        ).pack(anchor="w", padx=18, pady=(14, 0))
 
         ctk.CTkLabel(
             header,
             text=playlist_title[:75],
             font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
             text_color=COLORS["text_main"],
-        ).pack(anchor="w", padx=16, pady=(2, 10))
+        ).pack(anchor="w", padx=18, pady=(2, 10))
 
-        # Botones rápidos Marcar / Desmarcar todos
         bar = ctk.CTkFrame(header, fg_color="transparent")
-        bar.pack(fill="x", padx=16, pady=(0, 12))
+        bar.pack(fill="x", padx=18, pady=(0, 14))
 
         ctk.CTkButton(
             bar,
             text="Seleccionar todos",
-            width=130,
-            height=30,
+            width=140,
+            height=32,
+            corner_radius=16,
             fg_color=COLORS["bg_subtle"],
+            border_width=1,
+            border_color=COLORS["border"],
             text_color=COLORS["text_main"],
-            hover_color=COLORS["border"],
+            hover_color=COLORS["bg_hover"],
             command=lambda: self._set_all(True),
         ).pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
             bar,
             text="Desmarcar todos",
-            width=130,
-            height=30,
+            width=140,
+            height=32,
+            corner_radius=16,
             fg_color=COLORS["bg_subtle"],
+            border_width=1,
+            border_color=COLORS["border"],
             text_color=COLORS["text_main"],
-            hover_color=COLORS["border"],
+            hover_color=COLORS["bg_hover"],
             command=lambda: self._set_all(False),
         ).pack(side="left")
 
-        # Lista desplazable
-        scroll = ctk.CTkScrollableFrame(self, fg_color=COLORS["bg_card"], corner_radius=12)
-        scroll.pack(fill="both", expand=True, padx=16, pady=6)
+        scroll = ctk.CTkScrollableFrame(
+            self,
+            fg_color=COLORS["bg_card"],
+            corner_radius=16,
+            border_width=1,
+            border_color=COLORS["border"],
+        )
+        scroll.pack(fill="both", expand=True, padx=18, pady=6)
 
         for idx, item in enumerate(entries, start=1):
             var = ctk.BooleanVar(value=True)
@@ -282,33 +317,39 @@ class PlaylistSelectorDialog(ctk.CTkToplevel):
                 variable=var,
                 font=ctk.CTkFont(family="Segoe UI", size=13),
                 text_color=COLORS["text_main"],
-                fg_color=COLORS["accent"],
-                hover_color=COLORS["accent_hover"],
+                fg_color=COLORS["indigo"],
+                hover_color=COLORS["indigo_hover"],
+                border_color=COLORS["border"],
             )
-            row.pack(anchor="w", fill="x", padx=10, pady=5)
+            row.pack(anchor="w", fill="x", padx=12, pady=6)
 
-        # Pie con botón confirmar
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.pack(fill="x", padx=16, pady=(8, 16))
+        footer.pack(fill="x", padx=18, pady=(10, 18))
 
         ctk.CTkButton(
             footer,
             text="Cancelar",
             width=110,
-            height=38,
-            fg_color=COLORS["bg_subtle"],
+            height=40,
+            corner_radius=20,
+            fg_color="transparent",
+            border_width=1,
+            border_color=COLORS["border"],
             text_color=COLORS["text_main"],
-            hover_color=COLORS["border"],
+            hover_color=COLORS["bg_subtle"],
             command=self.destroy,
-        ).pack(side="right", padx=(8, 0))
+        ).pack(side="right", padx=(10, 0))
 
         ctk.CTkButton(
             footer,
-            text="Añadir seleccionados a la cola",
-            height=38,
+            text="Añadir seleccionados  →",
+            height=40,
+            width=210,
+            corner_radius=20,
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            fg_color=COLORS["primary"],
-            hover_color=COLORS["primary_hover"],
+            fg_color=COLORS["indigo"],
+            hover_color=COLORS["indigo_hover"],
+            text_color=COLORS["text_main"],
             command=self._confirm,
         ).pack(side="right")
 
@@ -326,7 +367,7 @@ class PlaylistSelectorDialog(ctk.CTkToplevel):
 
 
 # ==============================================================================
-# APLICACIÓN PRINCIPAL: AJRM-TUBE PARA WINDOWS 11
+# APLICACIÓN PRINCIPAL: AJRM-TUBE (ESTÉTICA NUNAY DIGITAL AGENCY)
 # ==============================================================================
 class AJRMTubeApp(ctk.CTk):
     def __init__(self):
@@ -334,78 +375,86 @@ class AJRMTubeApp(ctk.CTk):
         setup_environment()
 
         self.title("AJRM-Tube  |  Descargador Multimedia")
-        self.geometry("940x720")
-        self.minsize(840, 640)
+        self.geometry("980x750")
+        self.minsize(880, 660)
         self.configure(fg_color=COLORS["bg_main"])
 
         self.download_dir = str(Path.home() / "Downloads")
         self.current_info = None
         self.tasks = []
         self.task_widgets = {}
+        self.row_order = []
+        self._last_analyzed_url = ""
+        self._is_analyzing = False
 
         self._build_ui()
 
     def _build_ui(self):
         # ----------------------------------------------------------------------
-        # 1. BARRA SUPERIOR (Identidad limpia estilo Nunay Agencia)
+        # 1. BARRA SUPERIOR MINIMALISTA ESTILO NUNAY
         # ----------------------------------------------------------------------
-        topbar = ctk.CTkFrame(self, fg_color=COLORS["bg_card"], corner_radius=0, height=64)
-        topbar.pack(fill="x")
+        topbar = ctk.CTkFrame(
+            self,
+            fg_color=COLORS["bg_main"],
+            corner_radius=0,
+            height=72,
+        )
+        topbar.pack(fill="x", padx=28, pady=(8, 0))
         topbar.pack_propagate(False)
 
         brand_frame = ctk.CTkFrame(topbar, fg_color="transparent")
-        brand_frame.pack(side="left", padx=24)
+        brand_frame.pack(side="left")
 
         ctk.CTkLabel(
             brand_frame,
-            text="AJRM",
-            font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
-            text_color=COLORS["primary"],
+            text="ajrm",
+            font=ctk.CTkFont(family="Segoe UI", size=26, weight="bold"),
+            text_color=COLORS["text_main"],
         ).pack(side="left")
 
         ctk.CTkLabel(
             brand_frame,
-            text="•TUBE",
-            font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
-            text_color=COLORS["accent"],
-        ).pack(side="left", padx=(2, 12))
+            text="tube™",
+            font=ctk.CTkFont(family="Segoe UI", size=26, weight="bold"),
+            text_color=COLORS["indigo_text"],
+        ).pack(side="left", padx=(3, 16))
 
         ctk.CTkLabel(
             brand_frame,
             text="YouTube  •  Facebook  •  TikTok  •  Instagram",
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color=COLORS["text_muted"],
-        ).pack(side="left", pady=(3, 0))
+        ).pack(side="left", pady=(4, 0))
 
-        # Selector rápido de carpeta destino en barra superior
+        # Botones estilo píldora de Nunay
         folder_box = ctk.CTkFrame(topbar, fg_color="transparent")
-        folder_box.pack(side="right", padx=24)
+        folder_box.pack(side="right")
 
         self.folder_btn = ctk.CTkButton(
             folder_box,
             text=f"📁  {os.path.basename(self.download_dir)}",
-            height=34,
-            corner_radius=8,
-            fg_color=COLORS["bg_subtle"],
+            height=38,
+            corner_radius=19,
+            fg_color=COLORS["bg_card"],
+            border_width=1,
+            border_color=COLORS["border"],
             text_color=COLORS["text_main"],
-            hover_color=COLORS["border"],
+            hover_color=COLORS["bg_hover"],
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
             command=self._choose_folder,
         )
-        self.folder_btn.pack(side="left", padx=(0, 8))
+        self.folder_btn.pack(side="left", padx=(0, 10))
 
         ctk.CTkButton(
             folder_box,
-            text="Abrir carpeta",
-            height=34,
-            width=105,
-            corner_radius=8,
-            fg_color="transparent",
-            border_width=1,
-            border_color=COLORS["border"],
-            text_color=COLORS["text_muted"],
-            hover_color=COLORS["bg_subtle"],
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text="ABRIR CARPETA",
+            height=38,
+            width=135,
+            corner_radius=19,
+            fg_color=COLORS["indigo"],
+            hover_color=COLORS["indigo_hover"],
+            text_color=COLORS["text_main"],
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             command=self._open_folder,
         ).pack(side="left")
 
@@ -415,104 +464,123 @@ class AJRMTubeApp(ctk.CTk):
         main_card = ctk.CTkFrame(
             self,
             fg_color=COLORS["bg_card"],
-            corner_radius=16,
+            corner_radius=20,
             border_width=1,
             border_color=COLORS["border"],
         )
-        main_card.pack(fill="x", padx=24, pady=(20, 14))
+        main_card.pack(fill="x", padx=28, pady=(8, 16))
+
+        header_tag = ctk.CTkFrame(main_card, fg_color="transparent")
+        header_tag.pack(fill="x", padx=24, pady=(18, 8))
 
         ctk.CTkLabel(
-            main_card,
-            text="Pega el enlace del video, reel o playlist",
+            header_tag,
+            text="Descarga multimedia en",
             font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
             text_color=COLORS["text_main"],
-        ).pack(anchor="w", padx=20, pady=(16, 8))
+        ).pack(side="left")
 
-        # Fila URL + Botones Pegar y Analizar
+        ctk.CTkLabel(
+            header_tag,
+            text=" máxima calidad",
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            text_color=COLORS["indigo_text"],
+        ).pack(side="left")
+
+        # Fila URL + Botones estilo píldora (con auto-detección al pegar Ctrl+V)
         url_row = ctk.CTkFrame(main_card, fg_color="transparent")
-        url_row.pack(fill="x", padx=20, pady=(0, 14))
+        url_row.pack(fill="x", padx=24, pady=(0, 16))
+
+        self.url_var = ctk.StringVar()
+        self.url_var.trace_add("write", self._on_url_changed)
 
         self.url_entry = ctk.CTkEntry(
             url_row,
-            placeholder_text="https://www.youtube.com/watch?v=...  o enlace de TikTok / Facebook / Instagram",
-            height=42,
-            corner_radius=10,
+            textvariable=self.url_var,
+            placeholder_text="Pega aquí el enlace de YouTube, TikTok, Facebook o Instagram...",
+            height=44,
+            corner_radius=22,
             fg_color=COLORS["bg_subtle"],
+            border_width=1,
             border_color=COLORS["border"],
             text_color=COLORS["text_main"],
+            placeholder_text_color=COLORS["text_muted"],
             font=ctk.CTkFont(family="Segoe UI", size=13),
         )
         self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.url_entry.bind("<Return>", lambda e: self._analyze_url())
+        self.url_entry.bind("<Return>", lambda e: self._analyze_url(force=True))
 
         ctk.CTkButton(
             url_row,
             text="Pegar",
-            width=80,
-            height=42,
-            corner_radius=10,
-            fg_color=COLORS["bg_subtle"],
+            width=85,
+            height=44,
+            corner_radius=22,
+            fg_color="transparent",
+            border_width=1,
+            border_color=COLORS["border"],
             text_color=COLORS["text_main"],
-            hover_color=COLORS["border"],
+            hover_color=COLORS["bg_hover"],
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             command=self._paste_from_clipboard,
         ).pack(side="left", padx=(0, 8))
 
         self.analyze_btn = ctk.CTkButton(
             url_row,
-            text="Analizar enlace",
-            width=140,
-            height=42,
-            corner_radius=10,
-            fg_color=COLORS["primary"],
-            hover_color=COLORS["primary_hover"],
+            text="Analizar  →",
+            width=135,
+            height=44,
+            corner_radius=22,
+            fg_color=COLORS["indigo"],
+            hover_color=COLORS["indigo_hover"],
+            text_color=COLORS["text_main"],
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            command=self._analyze_url,
+            command=lambda: self._analyze_url(force=True),
         )
         self.analyze_btn.pack(side="left")
 
-        # Panel de Vista Previa (Miniatura + Título + Selector + Botón DESCARGAR)
+        # Panel de Vista Previa oscuro
         self.preview_frame = ctk.CTkFrame(
             main_card,
             fg_color=COLORS["bg_subtle"],
-            corner_radius=12,
+            corner_radius=16,
+            border_width=1,
+            border_color=COLORS["border"],
         )
-        self.preview_frame.pack(fill="x", padx=20, pady=(0, 18))
+        self.preview_frame.pack(fill="x", padx=24, pady=(0, 20))
 
-        # Miniatura
         self.thumb_label = ctk.CTkLabel(
             self.preview_frame,
-            text="Vista previa\ndel contenido",
-            width=210,
-            height=118,
-            fg_color=COLORS["border"],
+            text="Vista previa",
+            width=216,
+            height=122,
+            fg_color=COLORS["bg_main"],
             text_color=COLORS["text_muted"],
-            corner_radius=10,
+            corner_radius=12,
             font=ctk.CTkFont(family="Segoe UI", size=12),
         )
-        self.thumb_label.pack(side="left", padx=14, pady=14)
+        self.thumb_label.pack(side="left", padx=16, pady=16)
 
-        # Detalles y controles de descarga
         details_box = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
-        details_box.pack(side="left", fill="both", expand=True, padx=(0, 14), pady=14)
+        details_box.pack(side="left", fill="both", expand=True, padx=(0, 16), pady=16)
 
         self.platform_badge = ctk.CTkLabel(
             details_box,
             text="LISTO PARA ANALIZAR",
             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=COLORS["accent"],
+            text_color=COLORS["indigo_text"],
         )
         self.platform_badge.pack(anchor="w")
 
         self.title_label = ctk.CTkLabel(
             details_box,
-            text="Pega un enlace arriba para cargar su miniatura, título y opciones",
-            font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+            text="Pega un enlace arriba para ver su miniatura y elegir formato",
+            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
             text_color=COLORS["text_main"],
-            wraplength=540,
+            wraplength=560,
             justify="left",
         )
-        self.title_label.pack(anchor="w", pady=(2, 2))
+        self.title_label.pack(anchor="w", pady=(3, 3))
 
         self.meta_label = ctk.CTkLabel(
             details_box,
@@ -520,56 +588,70 @@ class AJRMTubeApp(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color=COLORS["text_muted"],
         )
-        self.meta_label.pack(anchor="w", pady=(0, 10))
+        self.meta_label.pack(anchor="w", pady=(0, 12))
 
-        # Fila de formato + calidad + botón DESCARGAR
+        # Fila de formato + selector con flecha blanca visible + botón DESCARGAR
         controls_row = ctk.CTkFrame(details_box, fg_color="transparent")
         controls_row.pack(fill="x")
 
         self.mode_segment = ctk.CTkSegmentedButton(
             controls_row,
             values=["Audio", "Video"],
-            width=150,
-            height=36,
-            selected_color=COLORS["primary"],
-            selected_hover_color=COLORS["primary_hover"],
+            width=155,
+            height=38,
+            corner_radius=19,
+            fg_color=COLORS["bg_main"],
+            selected_color=COLORS["indigo"],
+            selected_hover_color=COLORS["indigo_hover"],
+            unselected_color=COLORS["bg_main"],
+            unselected_hover_color=COLORS["bg_hover"],
+            text_color=COLORS["text_main"],
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             command=self._on_mode_change,
         )
         self.mode_segment.set("Audio")
         self.mode_segment.pack(side="left", padx=(0, 10))
 
-        self.quality_menu = ctk.CTkOptionMenu(
+        self.quality_menu = ctk.CTkComboBox(
             controls_row,
             values=["MP3 320 kbps (Recomendado)", "MP3 192 kbps", "M4A Original (Rápido)"],
-            width=225,
-            height=36,
-            fg_color=COLORS["bg_card"],
-            button_color=COLORS["primary"],
-            button_hover_color=COLORS["primary_hover"],
+            width=245,
+            height=38,
+            corner_radius=19,
+            state="readonly",
+            fg_color=COLORS["bg_main"],
+            border_width=1,
+            border_color=COLORS["border"],
+            button_color=COLORS["indigo"],
+            button_hover_color=COLORS["indigo_hover"],
+            dropdown_fg_color=COLORS["bg_card"],
+            dropdown_hover_color=COLORS["indigo"],
+            dropdown_text_color=COLORS["text_main"],
             text_color=COLORS["text_main"],
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
         )
-        self.quality_menu.pack(side="left", padx=(0, 10))
+        self.quality_menu.set("MP3 320 kbps (Recomendado)")
+        self.quality_menu.pack(side="left", padx=(0, 12))
 
         self.download_btn = ctk.CTkButton(
             controls_row,
-            text="DESCARGAR",
-            height=38,
-            corner_radius=10,
-            fg_color=COLORS["accent"],
-            hover_color=COLORS["accent_hover"],
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            text="DESCARGAR  ↓",
+            height=40,
+            corner_radius=20,
+            fg_color=COLORS["indigo"],
+            hover_color=COLORS["indigo_hover"],
+            text_color=COLORS["text_main"],
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             state="disabled",
             command=self._trigger_download,
         )
         self.download_btn.pack(side="right", fill="x", expand=True)
 
         # ----------------------------------------------------------------------
-        # 3. COLA DE DESCARGAS ACTIVA
+        # 3. COLA DE DESCARGAS (ORDENADA DE MÁS RECIENTE ARRIBA A MÁS ANTIGUA)
         # ----------------------------------------------------------------------
         queue_header = ctk.CTkFrame(self, fg_color="transparent")
-        queue_header.pack(fill="x", padx=24, pady=(4, 6))
+        queue_header.pack(fill="x", padx=28, pady=(2, 8))
 
         ctk.CTkLabel(
             queue_header,
@@ -580,24 +662,27 @@ class AJRMTubeApp(ctk.CTk):
 
         ctk.CTkButton(
             queue_header,
-            text="Limpiar completados",
+            text="Limpiar historial",
             height=28,
-            width=145,
+            width=125,
+            corner_radius=14,
             fg_color="transparent",
+            border_width=1,
+            border_color=COLORS["border"],
             text_color=COLORS["text_muted"],
-            hover_color=COLORS["border"],
-            font=ctk.CTkFont(family="Segoe UI", size=12),
+            hover_color=COLORS["bg_subtle"],
+            font=ctk.CTkFont(family="Segoe UI", size=11),
             command=self._clear_finished,
         ).pack(side="right")
 
         self.queue_scroll = ctk.CTkScrollableFrame(
             self,
             fg_color=COLORS["bg_card"],
-            corner_radius=16,
+            corner_radius=20,
             border_width=1,
             border_color=COLORS["border"],
         )
-        self.queue_scroll.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        self.queue_scroll.pack(fill="both", expand=True, padx=28, pady=(0, 22))
 
         self.empty_queue_label = ctk.CTkLabel(
             self.queue_scroll,
@@ -605,10 +690,10 @@ class AJRMTubeApp(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=13),
             text_color=COLORS["text_muted"],
         )
-        self.empty_queue_label.pack(pady=45)
+        self.empty_queue_label.pack(pady=48)
 
     # --------------------------------------------------------------------------
-    # ACCIONES DE INTERFAZ Y ANÁLISIS RÁPIDO
+    # ACCIONES DE INTERFAZ Y ANÁLISIS RÁPIDO AUTOMÁTICO
     # --------------------------------------------------------------------------
     def _choose_folder(self):
         selected = filedialog.askdirectory(initialdir=self.download_dir)
@@ -620,13 +705,22 @@ class AJRMTubeApp(ctk.CTk):
         if os.path.exists(self.download_dir):
             os.startfile(self.download_dir)
 
+    def _on_url_changed(self, *args):
+        """Dispara el análisis automáticamente al pegar cualquier URL válida (Ctrl+V o menú)."""
+        text = self.url_var.get().strip()
+        if (
+            (text.startswith("http://") or text.startswith("https://"))
+            and "." in text
+            and text != self._last_analyzed_url
+            and not self._is_analyzing
+        ):
+            self.after(150, self._analyze_url)
+
     def _paste_from_clipboard(self):
         try:
             text = self.clipboard_get().strip()
-            self.url_entry.delete(0, "end")
-            self.url_entry.insert(0, text)
-            if text.startswith("http"):
-                self._analyze_url()
+            self._last_analyzed_url = ""
+            self.url_var.set(text)
         except Exception:
             pass
 
@@ -642,14 +736,20 @@ class AJRMTubeApp(ctk.CTk):
             )
             self.quality_menu.set("1080p Full HD")
 
-    def _analyze_url(self):
-        url = self.url_entry.get().strip()
+    def _analyze_url(self, force: bool = False):
+        url = self.url_var.get().strip()
         if not url:
             return
+        if self._is_analyzing:
+            return
+        if not force and url == self._last_analyzed_url:
+            return
 
+        self._is_analyzing = True
+        self._last_analyzed_url = url
         self.analyze_btn.configure(state="disabled", text="Cargando...")
         self.download_btn.configure(state="disabled")
-        self.platform_badge.configure(text="ANALIZANDO ENLACE...")
+        self.platform_badge.configure(text="ANALIZANDO ENLACE...", text_color=COLORS["indigo_text"])
         self.title_label.configure(text="Obteniendo información rápida del servidor...")
         self.meta_label.configure(text="Por favor espera un momento...")
 
@@ -660,7 +760,7 @@ class AJRMTubeApp(ctk.CTk):
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
-                "extract_flat": "in_playlist",  # Carga instantánea incluso en playlists largas
+                "extract_flat": "in_playlist",
                 "skip_download": True,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -674,13 +774,15 @@ class AJRMTubeApp(ctk.CTk):
             self.after(0, lambda: self._show_analyze_error(err))
 
     def _show_analyze_error(self, err: str):
-        self.analyze_btn.configure(state="normal", text="Analizar enlace")
+        self._is_analyzing = False
+        self.analyze_btn.configure(state="normal", text="Analizar  →")
         self.platform_badge.configure(text="ERROR AL ANALIZAR", text_color=COLORS["danger"])
         self.title_label.configure(text="No se pudo leer este enlace")
         self.meta_label.configure(text=err[:90])
 
     def _update_preview(self, info: dict):
-        self.analyze_btn.configure(state="normal", text="Analizar enlace")
+        self._is_analyzing = False
+        self.analyze_btn.configure(state="normal", text="Analizar  →")
         self.download_btn.configure(state="normal")
 
         extractor = (info.get("extractor_key") or "WEB").upper()
@@ -691,7 +793,7 @@ class AJRMTubeApp(ctk.CTk):
             title = info.get("title") or "Playlist sin título"
             self.platform_badge.configure(
                 text=f"{extractor}  •  PLAYLIST ({len(entries)} ELEMENTOS)",
-                text_color=COLORS["accent"],
+                text_color=COLORS["indigo_text"],
             )
             self.title_label.configure(text=title)
             self.meta_label.configure(text="Presiona DESCARGAR para elegir qué elementos bajar")
@@ -700,7 +802,7 @@ class AJRMTubeApp(ctk.CTk):
             title = info.get("title") or "Video sin título"
             dur = format_duration(info.get("duration"))
             uploader = info.get("uploader") or info.get("channel") or "Desconocido"
-            self.platform_badge.configure(text=f"{extractor}  •  LISTO", text_color=COLORS["accent"])
+            self.platform_badge.configure(text=f"{extractor}  •  LISTO", text_color=COLORS["indigo_text"])
             self.title_label.configure(text=title)
             self.meta_label.configure(text=f"Duración: {dur}  •  Autor: {uploader}")
             thumb_url = info.get("thumbnail")
@@ -712,14 +814,14 @@ class AJRMTubeApp(ctk.CTk):
         try:
             resp = requests.get(thumb_url, timeout=6)
             img = Image.open(BytesIO(resp.content)).convert("RGB")
-            img = img.resize((210, 118), Image.Resampling.LANCZOS)
-            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(210, 118))
+            img = img.resize((216, 122), Image.Resampling.LANCZOS)
+            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(216, 122))
             self.after(0, lambda: self.thumb_label.configure(image=ctk_img, text=""))
         except Exception:
             pass
 
     # --------------------------------------------------------------------------
-    # GESTIÓN DE COLA DE DESCARGAS
+    # GESTIÓN DE COLA (NUEVOS ARRIBA + BOTÓN "ABRIR" AL COMPLETAR)
     # --------------------------------------------------------------------------
     def _trigger_download(self):
         if not self.current_info:
@@ -739,7 +841,7 @@ class AJRMTubeApp(ctk.CTk):
                 lambda selected: self._enqueue_playlist_items(selected, mode, quality),
             )
         else:
-            url = info.get("webpage_url") or self.url_entry.get().strip()
+            url = info.get("webpage_url") or self.url_var.get().strip()
             title = info.get("title") or "Archivo multimedia"
             self._add_task_to_queue(url, title, mode, quality)
 
@@ -764,7 +866,7 @@ class AJRMTubeApp(ctk.CTk):
             out_dir=self.download_dir,
             ui_callback=lambda t: self.after(0, lambda: self._refresh_task_row(t)),
         )
-        self.tasks.append(task)
+        self.tasks.insert(0, task)
         self._create_task_row(task)
         task.start()
 
@@ -772,12 +874,21 @@ class AJRMTubeApp(ctk.CTk):
         row = ctk.CTkFrame(
             self.queue_scroll,
             fg_color=COLORS["bg_subtle"],
-            corner_radius=12,
+            corner_radius=14,
+            border_width=1,
+            border_color=COLORS["border"],
         )
-        row.pack(fill="x", padx=10, pady=6)
+
+        # Insertar SIEMPRE arriba del todo
+        existing_rows = [r for r in self.row_order if r.winfo_exists()]
+        if existing_rows:
+            row.pack(fill="x", padx=12, pady=6, before=existing_rows[0])
+        else:
+            row.pack(fill="x", padx=12, pady=6)
+        self.row_order.insert(0, row)
 
         left = ctk.CTkFrame(row, fg_color="transparent")
-        left.pack(side="left", fill="both", expand=True, padx=14, pady=10)
+        left.pack(side="left", fill="both", expand=True, padx=16, pady=12)
 
         title_lbl = ctk.CTkLabel(
             left,
@@ -789,13 +900,13 @@ class AJRMTubeApp(ctk.CTk):
 
         progress_bar = ctk.CTkProgressBar(
             left,
-            height=8,
+            height=7,
             corner_radius=4,
-            fg_color=COLORS["border"],
-            progress_color=COLORS["accent"],
+            fg_color=COLORS["bg_main"],
+            progress_color=COLORS["indigo"],
         )
         progress_bar.set(0)
-        progress_bar.pack(fill="x", pady=(6, 4))
+        progress_bar.pack(fill="x", pady=(7, 5))
 
         status_lbl = ctk.CTkLabel(
             left,
@@ -805,37 +916,52 @@ class AJRMTubeApp(ctk.CTk):
         )
         status_lbl.pack(anchor="w")
 
-        # Botones de control: Pausar/Reanudar y Cancelar
+        # Controles derechos: Pausar / Cancelar (y al completar se reemplazan por "Abrir")
         btns = ctk.CTkFrame(row, fg_color="transparent")
-        btns.pack(side="right", padx=14)
+        btns.pack(side="right", padx=16)
 
         pause_btn = ctk.CTkButton(
             btns,
             text="Pausar",
-            width=84,
-            height=32,
-            corner_radius=8,
+            width=86,
+            height=34,
+            corner_radius=17,
             fg_color=COLORS["bg_card"],
+            border_width=1,
+            border_color=COLORS["border"],
             text_color=COLORS["text_main"],
-            hover_color=COLORS["border"],
+            hover_color=COLORS["bg_hover"],
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
             command=task.toggle_pause,
         )
-        pause_btn.pack(side="left", padx=(0, 6))
+        pause_btn.pack(side="left", padx=(0, 8))
 
         cancel_btn = ctk.CTkButton(
             btns,
             text="Cancelar",
-            width=84,
-            height=32,
-            corner_radius=8,
-            fg_color="#FEE2E2",
+            width=86,
+            height=34,
+            corner_radius=17,
+            fg_color="#2A1215",
             text_color=COLORS["danger"],
-            hover_color="#FECACA",
+            hover_color="#3F171C",
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
             command=task.cancel,
         )
         cancel_btn.pack(side="left")
+
+        open_btn = ctk.CTkButton(
+            btns,
+            text="▶  Abrir",
+            width=105,
+            height=34,
+            corner_radius=17,
+            fg_color=COLORS["indigo"],
+            hover_color=COLORS["indigo_hover"],
+            text_color=COLORS["text_main"],
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            command=task.open_file,
+        )
 
         self.task_widgets[task] = {
             "row": row,
@@ -843,6 +969,7 @@ class AJRMTubeApp(ctk.CTk):
             "status": status_lbl,
             "pause_btn": pause_btn,
             "cancel_btn": cancel_btn,
+            "open_btn": open_btn,
         }
 
     def _refresh_task_row(self, task: DownloadTask):
@@ -858,14 +985,15 @@ class AJRMTubeApp(ctk.CTk):
             widgets["pause_btn"].configure(text="Reanudar")
         elif task.status == "Completado":
             widgets["progress"].configure(progress_color=COLORS["success"])
-            widgets["pause_btn"].configure(state="disabled", text="Listo")
-            widgets["cancel_btn"].configure(state="disabled")
+            widgets["pause_btn"].pack_forget()
+            widgets["cancel_btn"].pack_forget()
+            widgets["open_btn"].pack(side="left")
         elif task.status in ("Cancelado", "Error"):
             widgets["progress"].configure(progress_color=COLORS["danger"])
             widgets["pause_btn"].configure(state="disabled")
             widgets["cancel_btn"].configure(state="disabled")
         else:
-            widgets["progress"].configure(progress_color=COLORS["accent"])
+            widgets["progress"].configure(progress_color=COLORS["indigo"])
             widgets["pause_btn"].configure(text="Pausar")
 
     def _clear_finished(self):
@@ -873,6 +1001,8 @@ class AJRMTubeApp(ctk.CTk):
             if task.status in ("Completado", "Cancelado", "Error"):
                 widgets = self.task_widgets.pop(task, None)
                 if widgets and widgets["row"].winfo_exists():
+                    if widgets["row"] in self.row_order:
+                        self.row_order.remove(widgets["row"])
                     widgets["row"].destroy()
                 self.tasks.remove(task)
 
