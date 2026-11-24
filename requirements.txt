@@ -1,1 +1,5 @@
-
+customtkinter==5.2.2
+yt-dlp>=2025.1.15
+Pillow>=10.4.0
+requests>=2.32.3
+pyinstaller>=6.11.0
